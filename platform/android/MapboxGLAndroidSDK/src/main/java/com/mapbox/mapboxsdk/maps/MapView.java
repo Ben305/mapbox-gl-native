@@ -8,7 +8,6 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.graphics.Canvas;
 import android.graphics.PointF;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -21,7 +20,6 @@ import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.annotation.UiThread;
 import android.support.v7.app.AlertDialog;
-import android.text.TextUtils;
 import android.util.AttributeSet;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
@@ -74,6 +72,7 @@ import static android.opengl.GLSurfaceView.RENDERMODE_WHEN_DIRTY;
 public class MapView extends FrameLayout {
 
   private NativeMapView nativeMapView;
+  private MapState mapState;
   private boolean destroyed;
 
   private GLSurfaceView glSurfaceView;
@@ -141,6 +140,7 @@ public class MapView extends FrameLayout {
     glSurfaceView = (GLSurfaceView) findViewById(R.id.surfaceView);
     glSurfaceView.setEGLConfigChooser(8, 8, 8, 0 /** TODO: What alpha value do we need here?? */, 16, 8);
     glSurfaceView.setEGLContextClientVersion(2);
+
     glSurfaceView.setRenderer(new GLSurfaceView.Renderer() {
       @Override
       public void onSurfaceCreated(final GL10 gl, EGLConfig eglConfig) {
@@ -149,6 +149,8 @@ public class MapView extends FrameLayout {
 
         // Create native Map object
         nativeMapView = new NativeMapView(MapView.this);
+        nativeMapView.setAccessToken(Mapbox.getAccessToken());
+        nativeMapView.setReachability(isConnected());
 
         //Continue configuring the map view on the main thread
         MapView.this.post(new Runnable() {
@@ -173,7 +175,6 @@ public class MapView extends FrameLayout {
         nativeMapView.render();
       }
     });
-
   }
 
   private void setupViewProperties() {
@@ -188,20 +189,26 @@ public class MapView extends FrameLayout {
     requestDisallowInterceptTouchEvent(true);
   }
 
-//  private void loopRender() {
-//    postDelayed(new Runnable() {
-//      @Override
-//      public void run() {
-//        //glSurfaceView.queueEvent(renderRunnable);
-//        onInvalidate();
-////        nativeMapView.update();
-//        //onInvalidate();
-//        loopRender();
-//      }
-//    }, 500);
-//  }
-
   protected void onNativeMapViewReady() {
+    ThreadExecutor threadExecutor = new ThreadExecutor() {
+      @Override
+      public void queueRenderEvent(final MapRunnable runnable) {
+        glSurfaceView.queueEvent(new Runnable() {
+          @Override
+          public void run() {
+            runnable.execute(nativeMapView);
+          }
+        });
+      }
+
+      @Override
+      public void queueUiEvent(Runnable runnable) {
+        glSurfaceView.post(runnable);
+      }
+    };
+
+
+    mapState = new MapState(nativeMapView, threadExecutor);
 
     // callback for focal point invalidation
     FocalPointInvalidator focalPoint = new FocalPointInvalidator(compassView);
@@ -213,14 +220,14 @@ public class MapView extends FrameLayout {
     CameraZoomInvalidator zoomInvalidator = new CameraZoomInvalidator();
 
     // setup components for MapboxMap creation
-    Projection proj = new Projection(nativeMapView);
+    Projection proj = new Projection(mapState, getWidth(), getHeight());
     UiSettings uiSettings = new UiSettings(proj, focalPoint, compassView, attrView, logoView);
     TrackingSettings trackingSettings = new TrackingSettings(myLocationView, uiSettings, focalPoint, zoomInvalidator);
     MyLocationViewSettings myLocationViewSettings = new MyLocationViewSettings(myLocationView, proj, focalPoint);
     MarkerViewManager markerViewManager = new MarkerViewManager((ViewGroup) findViewById(R.id.markerViewContainer));
-    AnnotationManager annotations = new AnnotationManager(nativeMapView, this, markerViewManager);
-    Transform transform = new Transform(nativeMapView, annotations.getMarkerViewManager(), trackingSettings);
-    mapboxMap = new MapboxMap(nativeMapView, transform, uiSettings, trackingSettings, myLocationViewSettings, proj,
+    AnnotationManager annotations = new AnnotationManager(nativeMapView, threadExecutor, this, markerViewManager);
+    Transform transform = new Transform(nativeMapView, threadExecutor, annotations.getMarkerViewManager(), trackingSettings);
+    mapboxMap = new MapboxMap(mapState, transform, uiSettings, trackingSettings, myLocationViewSettings, proj,
       registerTouchListener, annotations);
 
     // user input
@@ -232,9 +239,6 @@ public class MapView extends FrameLayout {
     compassView.setMapboxMap(mapboxMap);
     myLocationView.setMapboxMap(mapboxMap);
     attrView.setOnClickListener(new AttributionOnClickListener(getContext(), transform));
-
-    // notify Map object about current connectivity state
-    nativeMapView.setReachability(isConnected());
 
     // initialise MapboxMap
     mapboxMap.initialise(getContext(), mapboxMapOptions);
@@ -260,14 +264,12 @@ public class MapView extends FrameLayout {
    */
   @UiThread
   public void onCreate(@Nullable Bundle savedInstanceState) {
-    //nativeMapView.setAccessToken(Mapbox.getAccessToken());
-
     if (savedInstanceState == null) {
       MapboxTelemetry.getInstance().pushEvent(MapboxEvent.buildMapLoadEvent());
     } else if (savedInstanceState.getBoolean(MapboxConstants.STATE_HAS_SAVED_STATE)) {
+      mapState.onRestoreInstanceState(savedInstanceState);
       mapboxMap.onRestoreInstanceState(savedInstanceState);
     }
-
   }
 
   /**
@@ -280,6 +282,7 @@ public class MapView extends FrameLayout {
   @UiThread
   public void onSaveInstanceState(@NonNull Bundle outState) {
     outState.putBoolean(MapboxConstants.STATE_HAS_SAVED_STATE, true);
+    mapState.onSaveInstanceState(outState);
     mapboxMap.onSaveInstanceState(outState);
   }
 
@@ -336,10 +339,6 @@ public class MapView extends FrameLayout {
     }
 
     destroyed = true;
-    //nativeMapView.terminateContext();
-    //nativeMapView.terminateDisplay();
-    //nativeMapView.destroySurface();
-
     glSurfaceView.queueEvent(new Runnable() {
       @Override
       public void run() {
@@ -417,7 +416,12 @@ public class MapView extends FrameLayout {
    */
   @UiThread
   public void onLowMemory() {
-    nativeMapView.onLowMemory();
+    glSurfaceView.queueEvent(new Runnable() {
+      @Override
+      public void run() {
+        nativeMapView.onLowMemory();
+      }
+    });
   }
 
   // Called when debug mode is enabled to update a FPS counter
@@ -463,17 +467,12 @@ public class MapView extends FrameLayout {
    * @param url The URL of the map style
    * @see Style
    */
-  public void setStyleUrl(@NonNull String url) {
+  public void setStyleUrl(@NonNull final String url) {
     if (destroyed) {
       return;
     }
 
-    // stopgap for https://github.com/mapbox/mapbox-gl-native/issues/6242
-    if (TextUtils.isEmpty(nativeMapView.getAccessToken())) {
-      nativeMapView.setAccessToken(Mapbox.getAccessToken());
-    }
-
-    nativeMapView.setStyleUrl(url);
+    mapState.setStyleUrl(url);
   }
 
   //
@@ -499,30 +498,6 @@ public class MapView extends FrameLayout {
     }
   }
 
-  @Override
-  public void onDraw(Canvas canvas) {
-    Timber.i("onDraw");
-    super.onDraw(canvas);
-    if (isInEditMode()) {
-      return;
-    }
-
-    //glSurfaceView.queueEvent(renderRunnable);
-  }
-
-  @Override
-  protected void onSizeChanged(int width, int height, int oldw, int oldh) {
-    if (destroyed) {
-      return;
-    }
-
-    if (!isInEditMode()) {
-      if (nativeMapView != null) {
-        //XXX This should happen through GLSurfaceView#Renderer callbacks nativeMapView.resizeView(width, height);
-      }
-    }
-  }
-
   //
   // View events
   //
@@ -530,6 +505,7 @@ public class MapView extends FrameLayout {
   // Called when view is no longer connected
   @Override
   @CallSuper
+
   protected void onDetachedFromWindow() {
     super.onDetachedFromWindow();
     mapZoomButtonController.setVisible(false);
@@ -1019,16 +995,6 @@ public class MapView extends FrameLayout {
 
     void addOnMapReadyCallback(OnMapReadyCallback callback) {
       onMapReadyCallbackList.add(callback);
-    }
-  }
-
-  private class RenderRunnable implements Runnable {
-    @Override
-    public void run() {
-      if (destroyed) {
-        return;
-      }
-      nativeMapView.render();
     }
   }
 }
